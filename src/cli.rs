@@ -3,11 +3,6 @@
 use crate::{api, art, config};
 use anyhow::{Context, Result};
 use clap::Parser;
-use futures::StreamExt;
-use ytmapi_rs::auth::BrowserToken;
-use ytmapi_rs::common::{PlaylistID, YoutubeID};
-use ytmapi_rs::query::GetPlaylistTracksQuery;
-use ytmapi_rs::YtMusic;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,23 +67,7 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
             println!("  profile: {}", found.profile.display());
             println!("  cookies: {}", found.names.join(", "));
             println!();
-            // Same validation as a pasted header: a cookie that reads fine
-            // but the API rejects is worse than no cookie at all.
-            print!("checking… ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            match YtMusic::from_cookie(&found.header).await {
-                Ok(yt) => match validate_browser_session(&yt).await {
-                    Ok(pls) => {
-                        let path = cfg_dir.join("cookie.txt");
-                        write_secret(&path, found.header.as_bytes())?;
-                        println!("ok — {pls} playlists visible");
-                        println!("saved to {}", path.display());
-                    }
-                    Err(e) => anyhow::bail!("the browser's cookies were rejected by the API: {e}"),
-                },
-                Err(e) => anyhow::bail!("the browser's cookies could not be parsed: {e}"),
-            }
+            save_cookie(&found.header, cfg_dir).await?;
         }
         "cookie" => {
             println!("YouTube Music cookie setup");
@@ -111,22 +90,7 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
                 anyhow::bail!("no cookie provided");
             }
 
-            // Validate before saving, so a bad paste fails now and not later.
-            print!("checking… ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            match YtMusic::from_cookie(cookie).await {
-                Ok(yt) => match validate_browser_session(&yt).await {
-                    Ok(pls) => {
-                        let path = cfg_dir.join("cookie.txt");
-                        write_secret(&path, cookie.as_bytes())?;
-                        println!("ok — {pls} playlists visible");
-                        println!("saved to {}", path.display());
-                    }
-                    Err(e) => anyhow::bail!("cookie was rejected by the API: {e}"),
-                },
-                Err(e) => anyhow::bail!("cookie could not be parsed: {e}"),
-            }
+            save_cookie(cookie, cfg_dir).await?;
         }
 
         "oauth" => {
@@ -155,29 +119,6 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// A syntactically valid browser cookie can still be rejected by YouTube
-/// Music. Library endpoints return empty lists in that state, so probe the
-/// private Liked Music playlist too before saving credentials.
-async fn validate_browser_session(yt: &YtMusic<BrowserToken>) -> Result<usize> {
-    let playlists = yt.get_library_playlists().await?;
-    let query = GetPlaylistTracksQuery::new(PlaylistID::from_raw("VLLM"));
-    let pages = yt.stream(&query);
-    let mut pages = std::pin::pin!(pages);
-
-    match pages.next().await {
-        Some(Ok(_)) | None => Ok(playlists.len()),
-        Some(Err(e)) => {
-            let message = e.to_string();
-            if api::is_liked_music_sign_in_prompt(&message) {
-                anyhow::bail!(
-                    "YouTube Music rejected this session for Liked Music. Sign into https://music.youtube.com in Firefox with the intended account, then try again."
-                );
-            }
-            anyhow::bail!("could not verify Liked Music access: {message}");
-        }
-    }
 }
 
 /// Print what each library endpoint returns, so an empty library can be told
@@ -418,6 +359,64 @@ pub async fn run_diagnose(cfg_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+// Playlist subtitles are optional in some API responses. Validate the session
+// independently so a library parser failure cannot prevent credential setup.
+async fn save_cookie(cookie: &str, cfg_dir: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+
+    print!("checking… ");
+    std::io::stdout().flush().ok();
+    let yt = ytmapi_rs::YtMusic::from_cookie(cookie)
+        .await
+        .context("initializing cookie session")?;
+    let response = yt
+        .json_query(ytmapi_rs::query::GetLibraryPlaylistsQuery)
+        .await
+        .context("checking cookie session with the API")?;
+    let response: serde_json::Value = ytmapi_rs::json::from_json(response)?;
+    validate_cookie_session(&response)?;
+
+    let path = cfg_dir.join("cookie.txt");
+    write_secret(&path, cookie.as_bytes())?;
+    println!("ok — signed in");
+    println!("saved to {}", path.display());
+
+    match ytmapi_rs::process_json::<_, ytmapi_rs::auth::BrowserToken>(
+        serde_json::to_string(&response)?,
+        ytmapi_rs::query::GetLibraryPlaylistsQuery,
+    ) {
+        Ok(playlists) => println!("{} playlists visible", playlists.len()),
+        Err(_) => println!(
+            "warning: signed in, but playlist metadata could not be parsed; run `ytkew --diagnose` for details"
+        ),
+    }
+    Ok(())
+}
+
+fn validate_cookie_session(response: &serde_json::Value) -> Result<()> {
+    let logged_out = response
+        .pointer("/responseContext/mainAppWebResponseContext/loggedOut")
+        .and_then(serde_json::Value::as_bool);
+    let tracked_login = response
+        .pointer("/responseContext/serviceTrackingParams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|service| service.get("params").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|param| param.get("key").and_then(serde_json::Value::as_str) == Some("logged_in"))
+        .filter_map(|param| param.get("value").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+
+    if logged_out == Some(true) || tracked_login.contains(&"0") {
+        anyhow::bail!("the API reports a signed-out session; sign in to YouTube Music and retry");
+    }
+    if logged_out == Some(false) || tracked_login.contains(&"1") {
+        return Ok(());
+    }
+    anyhow::bail!("could not verify sign-in: the API response has no session status")
+}
+
 /// Write a credential with owner-only permissions. A session cookie grants
 /// full account access, so it must not be group- or world-readable.
 fn write_secret(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
@@ -437,4 +436,57 @@ fn read_line() -> Result<String> {
     let mut s = String::new();
     std::io::stdin().read_line(&mut s)?;
     Ok(s.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_cookie_session;
+    use serde_json::json;
+
+    #[test]
+    fn a_signed_in_session_does_not_require_playlist_subtitles() {
+        let response = json!({
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": false}},
+            "contents": {"musicTwoRowItemRenderer": {"subtitle": {"runs": [{"text": "Author"}]}}}
+        });
+        assert!(validate_cookie_session(&response).is_ok());
+    }
+
+    #[test]
+    fn service_tracking_can_verify_a_session_without_web_context() {
+        for (value, accepted) in [("1", true), ("0", false), ("unknown", false)] {
+            let response = json!({"responseContext": {"serviceTrackingParams": [
+                {"params": [{"key": "logged_in", "value": value}]}
+            ]}});
+            assert_eq!(validate_cookie_session(&response).is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn signed_out_status_takes_precedence_over_conflicting_tracking() {
+        let response = json!({"responseContext": {
+            "mainAppWebResponseContext": {"loggedOut": true},
+            "serviceTrackingParams": [{"params": [{"key": "logged_in", "value": "1"}]}]
+        }});
+        assert!(validate_cookie_session(&response).is_err());
+    }
+
+    #[test]
+    fn a_signed_out_session_is_rejected() {
+        let response = json!({
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": true}}
+        });
+        assert!(validate_cookie_session(&response).is_err());
+    }
+
+    #[test]
+    fn a_missing_or_malformed_session_status_is_not_accepted() {
+        for status in [json!(null), json!("false"), json!(0)] {
+            let response = json!({
+                "responseContext": {"mainAppWebResponseContext": {"loggedOut": status}}
+            });
+            assert!(validate_cookie_session(&response).is_err());
+        }
+        assert!(validate_cookie_session(&json!({})).is_err());
+    }
 }
