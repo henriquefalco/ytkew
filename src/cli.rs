@@ -3,6 +3,11 @@
 use crate::{api, art, config};
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::StreamExt;
+use ytmapi_rs::auth::BrowserToken;
+use ytmapi_rs::common::{PlaylistID, YoutubeID};
+use ytmapi_rs::query::GetPlaylistTracksQuery;
+use ytmapi_rs::YtMusic;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,12 +77,12 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
             print!("checking… ");
             use std::io::Write;
             std::io::stdout().flush().ok();
-            match ytmapi_rs::YtMusic::from_cookie(&found.header).await {
-                Ok(yt) => match yt.get_library_playlists().await {
+            match YtMusic::from_cookie(&found.header).await {
+                Ok(yt) => match validate_browser_session(&yt).await {
                     Ok(pls) => {
                         let path = cfg_dir.join("cookie.txt");
                         write_secret(&path, found.header.as_bytes())?;
-                        println!("ok — {} playlists visible", pls.len());
+                        println!("ok — {pls} playlists visible");
                         println!("saved to {}", path.display());
                     }
                     Err(e) => anyhow::bail!("the browser's cookies were rejected by the API: {e}"),
@@ -110,12 +115,12 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
             print!("checking… ");
             use std::io::Write;
             std::io::stdout().flush().ok();
-            match ytmapi_rs::YtMusic::from_cookie(cookie).await {
-                Ok(yt) => match yt.get_library_playlists().await {
+            match YtMusic::from_cookie(cookie).await {
+                Ok(yt) => match validate_browser_session(&yt).await {
                     Ok(pls) => {
                         let path = cfg_dir.join("cookie.txt");
                         write_secret(&path, cookie.as_bytes())?;
-                        println!("ok — {} playlists visible", pls.len());
+                        println!("ok — {pls} playlists visible");
                         println!("saved to {}", path.display());
                     }
                     Err(e) => anyhow::bail!("cookie was rejected by the API: {e}"),
@@ -123,6 +128,7 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
                 Err(e) => anyhow::bail!("cookie could not be parsed: {e}"),
             }
         }
+
         "oauth" => {
             println!("OAuth setup needs a Google Cloud OAuth client of type");
             println!("'TVs and Limited Input devices'.");
@@ -149,6 +155,29 @@ pub async fn run_auth(method: &str, cfg_dir: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A syntactically valid browser cookie can still be rejected by YouTube
+/// Music. Library endpoints return empty lists in that state, so probe the
+/// private Liked Music playlist too before saving credentials.
+async fn validate_browser_session(yt: &YtMusic<BrowserToken>) -> Result<usize> {
+    let playlists = yt.get_library_playlists().await?;
+    let query = GetPlaylistTracksQuery::new(PlaylistID::from_raw("VLLM"));
+    let pages = yt.stream(&query);
+    let mut pages = std::pin::pin!(pages);
+
+    match pages.next().await {
+        Some(Ok(_)) | None => Ok(playlists.len()),
+        Some(Err(e)) => {
+            let message = e.to_string();
+            if api::is_liked_music_sign_in_prompt(&message) {
+                anyhow::bail!(
+                    "YouTube Music rejected this session for Liked Music. Sign into https://music.youtube.com in Firefox with the intended account, then try again."
+                );
+            }
+            anyhow::bail!("could not verify Liked Music access: {message}");
+        }
+    }
 }
 
 /// Print what each library endpoint returns, so an empty library can be told

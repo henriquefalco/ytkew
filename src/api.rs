@@ -30,6 +30,8 @@ use ytmapi_rs::YtMusic;
 const NEEDS_AUTH: &str =
     "not signed in -- run `ytkew --auth cookie` or `ytkew --auth oauth` to reach your library";
 const OFFLINE: &str = "no connection to YouTube Music";
+const LIKED_MUSIC_SIGN_IN: &str =
+    "YouTube Music returned a sign-in page for Liked Music. Open https://music.youtube.com in Firefox with the intended account, then run `ytkew --auth browser` again.";
 
 /// Ceiling on the items a single paged query will pull. YouTube hands back
 /// roughly a hundred per page, so this allows about fifty round trips -- well
@@ -327,7 +329,7 @@ impl Api {
     /// to your library) -- an account commonly has liked songs and no library
     /// songs at all.
     pub async fn liked_songs_paged(&self, on_page: impl FnMut(Vec<Track>)) -> Result<()> {
-        self.playlist_tracks_paged("LM", on_page).await
+        explain_liked_music_sign_in(self.playlist_tracks_paged("LM", on_page).await)
     }
 
     pub async fn liked_songs(&self) -> Result<Vec<Track>> {
@@ -587,6 +589,28 @@ fn is_missing_shelf(msg: &str) -> bool {
         && (msg.contains("musicShelfRenderer") || msg.contains("gridRenderer"))
 }
 
+/// ytmapi-rs expects a playlist-shaped response for `VLLM`. YouTube Music
+/// instead returns a single-column page with a Sign in button when the saved
+/// browser session is not accepted. The dependency reports that shape as a
+/// missing playlist shelf, which otherwise leaks an implementation path into
+/// the UI. Keep this deliberately narrow: other parser failures still surface
+/// so an API change cannot masquerade as an authentication problem.
+pub(crate) fn is_liked_music_sign_in_prompt(msg: &str) -> bool {
+    msg.contains("not found in Api response")
+        && msg.contains(
+            "/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer",
+        )
+}
+
+fn explain_liked_music_sign_in(res: Result<()>) -> Result<()> {
+    match res {
+        Err(e) if is_liked_music_sign_in_prompt(&e.to_string()) => {
+            Err(anyhow!(LIKED_MUSIC_SIGN_IN))
+        }
+        other => other,
+    }
+}
+
 fn empty_on_missing_shelf<T: Default>(res: Result<T, ytmapi_rs::Error>) -> Result<T> {
     match res {
         Ok(v) => Ok(v),
@@ -708,6 +732,25 @@ mod tests {
     fn an_already_prefixed_id_is_left_alone() {
         assert_eq!(browse_id("VLLM"), "VLLM");
         assert_eq!(browse_id("VLPLabc123"), "VLPLabc123");
+    }
+
+    #[test]
+    fn detects_the_liked_music_sign_in_shape() {
+        let error = "Key /contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer not found in Api response.";
+        assert!(is_liked_music_sign_in_prompt(error));
+    }
+
+    #[test]
+    fn leaves_unrelated_parser_failures_visible() {
+        let error = "Key /contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer not found in Api response.";
+        assert!(!is_liked_music_sign_in_prompt(error));
+    }
+
+    #[test]
+    fn explains_the_liked_music_sign_in_shape() {
+        let error = anyhow!("Key /contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer not found in Api response.");
+        let explained = explain_liked_music_sign_in(Err(error)).unwrap_err();
+        assert!(explained.to_string().contains("run `ytkew --auth browser`"));
     }
 
     impl Api {
